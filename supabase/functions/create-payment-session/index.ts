@@ -50,7 +50,7 @@ serve(async (req: any) => {
     // Get user's workshop information
     const { data: profile, error: profileError } = await supabaseClient
       .from('profiles')
-      .select('workshop_id')
+      .select('workshop_id, full_name')
       .eq('id', user.id)
       .single()
 
@@ -89,6 +89,31 @@ serve(async (req: any) => {
     const successRedirect = successUrl?.setting_value?.value || '/payment/success'
     const cancelRedirect = cancelUrl?.setting_value?.value || '/payment/cancel'
 
+    // Create or get Stripe customer
+    // First, try to find existing customer by email
+    const existingCustomers = await stripe.customers.list({
+      email: user.email,
+      limit: 1
+    })
+    
+    let customer
+    if (existingCustomers.data.length > 0) {
+      // Use existing customer
+      customer = existingCustomers.data[0]
+      console.log('Using existing Stripe customer:', customer.id)
+    } else {
+      // Create new customer
+      customer = await stripe.customers.create({
+        email: user.email,
+        name: profile.full_name || user.email,
+        metadata: {
+          user_id: user.id,
+          workshop_id: profile.workshop_id
+        }
+      })
+      console.log('Created new Stripe customer:', customer.id)
+    }
+
     // Create Stripe Checkout Session
     const sessionData = {
       payment_method_types: ['card'],
@@ -108,7 +133,9 @@ serve(async (req: any) => {
       mode: 'payment',
       success_url: `${baseUrl}${successRedirect}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${baseUrl}${cancelRedirect}?session_id={CHECKOUT_SESSION_ID}`,
-      customer_email: user.email,
+      customer: customer.id, // Use existing customer ID
+      // NOTE: Do NOT use customer_creation when customer ID is provided
+      // This prevents conflicts and ensures the existing customer is used
       metadata: {
         user_id: user.id,
         workshop_id: profile.workshop_id,
@@ -122,13 +149,17 @@ serve(async (req: any) => {
 
     // Store payment record in database using the new payments table
     const paymentParams = {
+      user_id_param: user.id,
       workshop_id_param: profile.workshop_id,
       stripe_payment_intent_id_param: session.payment_intent as string,
       stripe_session_id_param: session.id,
       amount_cents_param: Math.round(amount * 100), // Convert to cents
       currency_param: 'EUR',
       analysis_month_param: new Date().toISOString().slice(0, 7), // YYYY-MM
-      description_param: description || 'Análisis adicional'
+      analyses_purchased_param: 1,
+      unit_price_cents_param: Math.round(amount * 100), // Same as amount for single analysis
+      description_param: description || 'Análisis adicional',
+      stripe_customer_id_param: customer.id
     }
     
     const { data: paymentId, error: dbError } = await supabaseClient
